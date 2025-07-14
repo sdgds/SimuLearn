@@ -1,3 +1,4 @@
+```mermaid
 graph TB
     %% 核心层
     subgraph Core ["🔧 核心层 (Core)"]
@@ -56,3 +57,4 @@ graph TB
     Analysis -.->|性能反馈| Training
     Interface -.->|用户输入| Training
     Interface -.->|配置| Core
+'''
