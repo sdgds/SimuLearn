@@ -16,24 +16,14 @@ graph TD
         direction TB
         BaseNeuron["Neuron (Base Class)<br/><b>功能:</b> 定义神经元通用接口<br/><b>关键参数:</b> size, V_th, V_reset"]
         PointNeuron["点神经元模型<br/>LIF, ExpLIF, Izhikevich, HH<br/><b>功能:</b> 实现单个神经元的动力学方程<br/><b>输入:</b> 突触电流 I_syn, 外部激励 I_e<br/><b>输出:</b> 膜电位 V_m, 脉冲<br/><b>物理意义:</b> 模拟单个神经元的电生理活动"]
-        MCNeuron["多室神经元 (MCNeuron)<br/><b>功能:</b> 模拟具有复杂树突形态的神经元<br/><b>输入:</b> 各区室的突触电流<br/><b>输出:</b> 各区室的膜电位, 脉冲<br/><b>物理意义:</b> 更精细地模拟神经元形态和电信号整合"]
         Generators["脉冲发生器<br/>Poisson, Bernoulli, SpikeGenerator<br/><b>功能:</b> 产生外部输入脉冲序列<br/><b>输出:</b> 脉冲序列<br/><b>物理意义:</b> 模拟来自大脑其他区域或感觉器官的输入信号"]
         SJWrapper["SpikingJelly Wrapper<br/><b>功能:</b> 将内部神经元模型包装为SpikingJelly兼容层<br/><b>实现:</b> 继承torch.nn.Module<br/><b>输出:</b> 可微分的神经元模型"]
         BaseSynapse["Synapse (Base Class)<br/><b>功能:</b> 定义突触通用接口<br/><b>关键参数:</b> pre, post, conn, weight"]
-        StaticSynapse["静态突触 (StaticSynapse)<br/><b>功能:</b> 传递固定强度的突触后电流<br/><b>输入:</b> 突触前脉冲<br/><b>输出:</b> 突触后电流<br/><b>物理意义:</b> 强度不变的神经连接"]
-        STDPSynapse["STDP 学习突触<br/>STDPAll2All, STDPNearest<br/><b>功能:</b> 根据脉冲时序依赖可塑性规则调整突触权重<br/><b>输入:</b> 突触前/后脉冲时间<br/><b>输出:</b> 突触后电流, 更新后的权重<br/><b>物理意义:</b> 模拟Hebb学习等生物学习机制"]
-        LearnableSynapse["可学习突触<br/><b>功能:</b> 支持梯度下降的突触权重<br/><b>实现:</b> torch.nn.Parameter包装<br/><b>输出:</b> 可通过BPTT优化的突触连接"]
         Connector["Connector (Base Class)<br/><b>功能:</b> 定义神经元之间的连接方式<br/><b>实现:</b> OneToOne, AllToAll, FixedProb<br/><b>输入:</b> 突触前/后神经元群体<br/><b>输出:</b> 连接矩阵或连接列表<br/><b>物理意义:</b> 构建神经网络的拓扑结构"]
         
         BaseNeuron --> PointNeuron
-        BaseNeuron --> MCNeuron
         PointNeuron --> SJWrapper
-        MCNeuron --> SJWrapper
-        BaseSynapse --> StaticSynapse
-        BaseSynapse --> STDPSynapse
-        BaseSynapse --> LearnableSynapse
         PointNeuron --> BaseSynapse
-        MCNeuron --> BaseSynapse
         Generators --> BaseSynapse
         Connector --> BaseSynapse
     end
@@ -47,7 +37,6 @@ graph TD
         
         SNet --> SJBackend
         PointNeuron --> Solvers
-        MCNeuron --> Solvers
         SNet --> Parallel
     end
 
@@ -65,10 +54,14 @@ graph TD
         LossFunction["Loss Functions<br/><b>实现:</b> MSE, CrossEntropy, SpikingRate<br/><b>功能:</b> 定义学习目标<br/><b>输入:</b> 预测值, 目标值<br/><b>输出:</b> 损失标量"]
         Optimizer["Optimizer<br/><b>实现:</b> Adam, SGD, RMSprop<br/><b>功能:</b> 更新网络参数<br/><b>输入:</b> 梯度<br/><b>输出:</b> 更新后的参数"]
         Trainer["Training Manager<br/><b>功能:</b> 管理训练循环<br/><b>流程:</b> 前向传播→损失计算→反向传播→参数更新<br/><b>输出:</b> 训练后的模型"]
+        STDPSynapse["STDP 学习突触<br/><b>功能:</b> 基于SpikingJelly的脉冲时序依赖可塑性<br/><b>实现:</b> spikingjelly.learning.STDPLearner<br/><b>输入:</b> 突触前/后脉冲时间<br/><b>输出:</b> 突触后电流, 更新后的权重<br/><b>物理意义:</b> 模拟Hebb学习等生物学习机制"]
+        LearnableSynapse["可学习突触<br/><b>功能:</b> 基于SpikingJelly的梯度下降突触权重<br/><b>实现:</b> spikingjelly.activation_based.layer.Linear<br/><b>输出:</b> 可通过BPTT优化的突触连接"]
         
         BPTTEngine --> LossFunction
         BPTTEngine --> Optimizer
         Trainer --> BPTTEngine
+        STDPSynapse --> BPTTEngine
+        LearnableSynapse --> BPTTEngine
     end
 
     %% 模块间连接
@@ -81,7 +74,6 @@ graph TD
     NESTAdapter --> PointNeuron
     Config --> SNet
     SJWrapper --> BPTTEngine
-    LearnableSynapse --> BPTTEngine
     Monitor --> SNet
     Recorder --> SNet
     Trainer --> SNet
@@ -104,7 +96,7 @@ graph TD
     
     class BMTKLoader,NESTAdapter externalStyle
     class Config configStyle
-    class BaseNeuron,PointNeuron,MCNeuron,Generators,BaseSynapse,StaticSynapse,STDPSynapse,Connector,SJWrapper,LearnableSynapse constructStyle
+    class BaseNeuron,PointNeuron,Generators,BaseSynapse,Connector,SJWrapper constructStyle
     class SNet,Solvers,Parallel,SJBackend simStyle
     class Monitor,Recorder monitorStyle
-    class BPTTEngine,LossFunction,Optimizer,Trainer learnStyle
+    class BPTTEngine,LossFunction,Optimizer,Trainer,STDPSynapse,LearnableSynapse learnStyle
