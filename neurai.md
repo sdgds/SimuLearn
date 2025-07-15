@@ -1,3 +1,4 @@
+```mermaid
 graph TB
     %% 核心配置层
     Config[Config 配置管理]
