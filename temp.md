@@ -1,4 +1,4 @@
-
+```mermaid
 graph TD
     %% BMTK 输入层
     A[BMTK Network Builder] --> B[SONATA Files]
