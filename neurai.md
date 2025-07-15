@@ -52,15 +52,17 @@ graph TD
 
     %% 调用关系 (Call Relationships)
     Config -- "提供全局参数" --> SNet
-    SNet -- "包含并管理" --> NeuronModels[神经元/发生器]
-    SNet -- "包含并管理" --> SynapseModels[突触]
-    NeuronModels -- "状态更新依赖" --> Solvers
-    SNet -- "执行仿真循环, 调用" --> NeuronModels
-    SNet -- "执行仿真循环, 调用" --> SynapseModels
+    SNet -- "包含并管理" --> PointNeuron
+    SNet -- "包含并管理" --> MCNeuron
+    SNet -- "包含并管理" --> Generators
+    SNet -- "包含并管理" --> StaticSynapse
+    SNet -- "包含并管理" --> STDPSynapse
+    PointNeuron -- "状态更新依赖" --> Solvers
+    MCNeuron -- "状态更新依赖" --> Solvers
     SNet -- "分布式计算依赖" --> Parallel
     Monitor -- "配置监控任务给" --> SNet
     Recorder -- "从SNet中记录" --> SNet
 
     classDef default fill:#f9f9f9,stroke:#333,stroke-width:2px;
-    classDef subgraph-style fill:#ececff,stroke:#9370db,stroke-width:2px,color:#333;
-    class SNet,Config,BaseNeuron,BaseSynapse,Connector,Solvers,Parallel,Monitor,Recorder subgraph-style
+    classDef subgraphStyle fill:#ececff,stroke:#9370db,stroke-width:2px,color:#333;
+    class SNet,Config,BaseNeuron,PointNeuron,MCNeuron,Generators,BaseSynapse,StaticSynapse,STDPSynapse,Connector,Solvers,Parallel,Monitor,Recorder subgraphStyle;
