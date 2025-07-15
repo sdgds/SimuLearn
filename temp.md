@@ -1,66 +1,67 @@
 ```mermaid
 graph TD
-    subgraph "输入层: BMTK/SONATA 生态系统"
+    subgraph "输入层 (Input Layer) - BMTK/SONATA" 
         direction LR
-        BMTK_Builder["BMTK Network Builder"]
-        SONATA["SONATA 文件<br/>(nodes.h5, edges.h5, *.csv, *.json)"]
-        BMTK_Builder --> SONATA
+        style InputLayer fill:#f2f2f2,stroke:#666,stroke-width:2px
+        Nodes["节点文件<br/>(nodes.h5, node_types.csv)"]
+        Edges["边文件<br/>(edges.h5, edge_types.csv)"]
+        Components["模型组件<br/>(neuron_models.json, syn_models.json)"]
     end
 
-    subgraph "SimuLearn 核心: 模型加载与转换"
-        direction LR
-        Loader["SonataLoader<br/><b>功能:</b> 解析SONATA格式文件<br/><b>输入:</b> SONATA文件路径<br/><b>输出:</b> 内部网络表示 (节点, 连接, 参数)"]
-        Converter["ModelConverter<br/><b>功能:</b> 将SONATA/NEST模型映射到SpikingJelly<br/><b>输入:</b> 内部网络表示<br/><b>输出:</b> SpikingJelly兼容的层和参数"]
-        SONATA --> Loader
-        Loader --> Converter
+    subgraph "SimuLearn 工具包 (SimuLearn Toolkit)"
+        direction TB
+        subgraph "<font color='blue'>网络构建与加载 (Network Construction & Loading)</font>"
+            direction LR
+            style Construction fill:#e0f7fa,stroke:#00796b,stroke-width:2px
+            SonataLoader["<b>SONATA 加载器 (SonataLoader)</b><br/><b>功能:</b> 解析BMTK/NEST网络文件<br/><b>输入:</b> SONATA格式文件<br/><b>输出:</b> 网络拓扑和参数的Python对象<br/><b>兼容性:</b> 直接利用BMTK和NEST定义的模型"]
+            NetworkBuilder["<b>网络构建器 (NetworkBuilder)</b><br/><b>功能:</b> 将解析的数据转换为SpikingJelly模型<br/><b>输入:</b> Loader输出的Python对象<br/><b>输出:</b> SpikingJelly网络 (torch.nn.Module)"]
+        end
+
+        SJ_Network["<b>SpikingJelly 网络 (torch.nn.Module)</b><br/>包含SpikingJelly的神经元、突触和连接器"]
+
+        subgraph "<font color='green'>仿真引擎 (Simulation Engine)</font>"
+            direction LR
+            style Simulation fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+            Simulator["<b>前向模拟器 (Simulator)</b><br/><b>功能:</b> 执行网络的前向传播<br/><b>核心:</b> 调用SpikingJelly网络进行单步或多步仿真<br/><b>输出:</b> 脉冲、膜电位等状态"]
+            Monitor["<b>监视器 (Monitor)</b><br/><b>功能:</b> 记录仿真过程中的网络状态<br/><b>实现:</b> 基于SpikingJelly的Monitor<br/><b>输出:</b> HDF5或内存中的数据"]
+        end
+
+        subgraph "<font color='orange'>学习引擎 (Learning Engine)</font>"
+            direction LR
+            style Learning fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+            BPTTEngine["<b>BPTT 训练器 (BPTT Trainer)</b><br/><b>功能:</b> 使用BPTT算法训练网络参数<br/><b>核心:</b> SpikingJelly的函数式编程接口<br/><b>输入:</b> 网络, 输入数据, 目标输出<br/><b>输出:</b> 训练好的网络模型"]
+            Loss["<b>损失函数 (Loss Function)</b><br/>定义学习任务的目标"]
+            Optimizer["<b>优化器 (Optimizer)</b><br/>如Adam, SGD，更新网络权重"]
+        end
     end
 
-    subgraph "网络构建与仿真 (SpikingJelly)"
+    subgraph "输出层 (Output Layer)"
         direction LR
-        SJ_Network["SpikingJelly Network (torch.nn.Module)<br/><b>功能:</b> 包含LIF神经元层和可训练的连接层(nn.Linear)<br/><b>构建:</b> 由Converter输出的组件组装而成"]
-        Simulator["Simulator<br/><b>功能:</b> 运行前向仿真<br/><b>输入:</b> 输入脉冲, 仿真时长<br/><b>输出:</b> 输出脉冲, 神经元状态(膜电位等)<br/><b>物理意义:</b> 模拟网络在给定输入下的动态响应"]
-        Converter --> SJ_Network
-        SJ_Network --> Simulator
+        style OutputLayer fill:#f2f2f2,stroke:#666,stroke-width:2px
+        SimResults["仿真结果<br/>(脉冲、膜电位)"]
+        TrainedModel["训练后的模型<br/>(优化的网络参数)"]
     end
 
-    subgraph "学习引擎 (BPTT)"
-        direction LR
-        Trainer["BPTT Trainer<br/><b>功能:</b> 通过时间反向传播算法训练网络<br/><b>关键步骤:</b> 1. 运行前向仿真<br/>2. 计算损失函数<br/>3. 自动微分求梯度<br/>4. 更新权重<br/><b>输入:</b> 仿真结果, 目标输出<br/><b>输出:</b> 优化后的网络参数"] 
-        Loss["Loss Function<br/>(e.g., van Rossum distance, MSE)<br/><b>功能:</b> 定义学习目标<br/><b>输入:</b> 实际输出, 期望输出<br/><b>输出:</b> 损失值<br/><b>物理意义:</b> 量化网络行为与期望行为的差距"]
-        Optimizer["Optimizer (e.g., Adam, SGD)<br/><b>功能:</b> 根据梯度更新网络权重<br/><b>输入:</b> 网络参数, 学习率<br/><b>输出:</b> 更新后的参数"] 
-        Simulator --> Trainer
-        Trainer --> Loss
-        Loss --> Trainer
-        Trainer --> Optimizer
-        Optimizer --> SJ_Network
-    end
+    %% 流程关系
+    Nodes --> SonataLoader
+    Edges --> SonataLoader
+    Components --> SonataLoader
+    SonataLoader --> NetworkBuilder
+    NetworkBuilder --> SJ_Network
+    
+    SJ_Network --> Simulator
+    Simulator --> Monitor
+    Monitor --> SimResults
 
-    subgraph "监控与输出"
-        direction LR
-        Monitor["SpikingJelly Monitor<br/><b>功能:</b> 记录脉冲和状态变量<br/><b>输入:</b> 网络中的层<br/><b>输出:</b> 脉冲序列, 膜电位轨迹"] 
-        Output["输出<br/>(HDF5, Npz, etc.)<br/><b>功能:</b> 保存训练结果和仿真数据"] 
-        SJ_Network --> Monitor
-        Trainer --> Output
-        Monitor --> Output
-    end
+    SJ_Network --> BPTTEngine
+    Loss --> BPTTEngine
+    Optimizer --> BPTTEngine
+    BPTTEngine --> TrainedModel
 
-    %% 关系
-    BMTK_Builder -- "生成" --> SONATA
-    SONATA -- "加载" --> Loader
-    Loader -- "传递解析数据" --> Converter
-    Converter -- "构建" --> SJ_Network
-    SJ_Network -- "用于" --> Simulator
-    Simulator -- "提供仿真轨迹" --> Trainer
-    Trainer -- "驱动" --> Optimizer
-    Optimizer -- "更新" --> SJ_Network
-
-    %% 样式定义
-    classDef simulationStyle fill:#e3f2fd,stroke:#0d47a1,stroke-width:2px
-    classDef learningStyle fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
-    classDef ioStyle fill:#fffde7,stroke:#f57f17,stroke-width:2px
-    classDef coreStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-
-    class BMTK_Builder,SONATA ioStyle
-    class Loader,Converter coreStyle
-    class SJ_Network,Simulator,Monitor,Output simulationStyle
-    class Trainer,Loss,Optimizer learningStyle
+    classDef Construction fill:#e0f7fa,stroke:#00796b,stroke-width:2px,color:blue;
+    classDef Simulation fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:green;
+    classDef Learning fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:orange;
+    class SonataLoader,NetworkBuilder Construction;
+    class Simulator,Monitor Simulation;
+    class BPTTEngine,Loss,Optimizer Learning;
+    class SJ_Network fill:#ede7f6,stroke:#5e35b1,stroke-width:2px;
