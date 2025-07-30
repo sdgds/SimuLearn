@@ -1,9 +1,226 @@
 import torch
-import torch.nn as nn
 import numpy as np
 import json
 from spikingjelly.activation_based import neuron, functional, surrogate
 from typing import Optional, Callable
+
+
+class MathUtils:
+    """Mathematical utilities for neural dynamics computations."""
+    
+    @staticmethod
+    def integration_coefficient(rates, dt: float, scaling=1.0):
+        """Integration coefficient: scaling * (1 - exp(-rates*dt)) / rates"""
+        rates_arr = np.asarray(rates)
+        decay_factors = np.exp(-rates_arr * dt)
+        return np.asarray(scaling) * (1.0 - decay_factors) / rates_arr
+    
+    @staticmethod
+    def alpha_coefficients(tau: float, dt: float) -> tuple:
+        """Alpha-function coefficients: (exp(-dt/tau), dt*exp(-dt/tau))"""
+        decay_factor = np.exp(-dt / tau)
+        return decay_factor, dt * decay_factor
+    
+    @staticmethod
+    def exponential_coupling(tau_source: float, tau_target: float, 
+                           dt: float, scaling: float = 1.0) -> tuple:
+        """Coupling coefficients between two exponential systems"""
+        if abs(tau_source - tau_target) < 1e-10:
+            # Handle special case where time constants are nearly equal
+            exp_factor = np.exp(-dt / tau_source)
+            coeff1 = scaling * dt * exp_factor
+            coeff2 = scaling * dt * exp_factor
+        else:
+            # General case: different time constants
+            beta = tau_source * tau_target / (tau_target - tau_source)
+            gamma = beta * scaling
+            
+            exp_h_tau_source = np.exp(-dt / tau_source)
+            expm1_h_tau = np.expm1(dt * (1/tau_source - 1/tau_target))
+            
+            coeff2 = gamma * exp_h_tau_source * expm1_h_tau
+            coeff1 = gamma * exp_h_tau_source * (beta * expm1_h_tau - dt)
+        
+        return coeff1, coeff2
+
+
+class ExponentialIntegrator:
+    """Universal exponential dynamics integrator for neural components"""
+    
+    def __init__(self, rates, dt: float, scaling=None, amplitudes=None, t_ref: float = 0.0):
+        """
+        Initialize exponential integrator
+        
+        rates: decay rate(s) - scalar for membrane, array for ASC
+        dt: time step
+        scaling: scaling factor(s) for integration  
+        amplitudes: spike increment amplitudes (for ASC only)
+        t_ref: refractory period (for ASC only)
+        """
+        self.dt = dt
+        self.t_ref = t_ref
+        
+        # Handle both scalar and array inputs
+        self.rates = np.asarray(rates, dtype=np.float32)
+        self.is_scalar = np.isscalar(rates)
+        
+        # Compute decay factors - ensure array format for torch.from_numpy
+        decay_vals = np.exp(-self.rates * dt)
+        self.decay_factors = torch.from_numpy(np.atleast_1d(decay_vals))
+        
+        # Compute integration coefficients
+        if scaling is not None:
+            integration_vals = MathUtils.integration_coefficient(self.rates, dt, scaling)
+            self.integration_coeffs = torch.from_numpy(np.atleast_1d(integration_vals))
+        else:
+            self.integration_coeffs = None
+            
+        # ASC-specific parameters
+        if amplitudes is not None:
+            self.amplitudes = torch.from_numpy(np.asarray(amplitudes, dtype=np.float32))
+            refractory_vals = np.exp(-self.rates * t_ref) if t_ref > 0 else np.ones_like(self.rates)
+            self.refractory_decay = torch.from_numpy(np.atleast_1d(refractory_vals))
+        else:
+            self.amplitudes = None
+            self.refractory_decay = None
+    
+    def integrate_step(self, current_state: torch.Tensor, 
+                      input_current: torch.Tensor = None,
+                      modulation_factor: torch.Tensor = None) -> torch.Tensor:
+        """Universal integration step"""
+        if modulation_factor is None:
+            modulation_factor = torch.tensor(1.0)
+            
+        # Get decay factors in appropriate shape
+        decay_factors = self.decay_factors[0] if self.is_scalar else self.decay_factors
+        
+        # Basic exponential decay
+        updated_state = current_state * decay_factors
+        
+        # Add input contribution if provided
+        if input_current is not None and self.integration_coeffs is not None:
+            integration_coeffs = self.integration_coeffs[0] if self.is_scalar else self.integration_coeffs
+            updated_state += input_current * integration_coeffs
+            
+        # Apply modulation factor
+        return modulation_factor * updated_state + (1.0 - modulation_factor) * current_state
+    
+    def get_membrane_contribution(self, state: torch.Tensor) -> torch.Tensor:
+        """Calculate contribution to membrane potential (for ASC)"""
+        if self.integration_coeffs is not None and not self.is_scalar:
+            return torch.sum(self.integration_coeffs * state)
+        return state
+    
+    def apply_spike_increment(self, current_state: torch.Tensor, 
+                             spike_signal: torch.Tensor) -> torch.Tensor:
+        """Apply increment during spike events (for ASC)"""
+        if self.amplitudes is None:
+            return current_state
+            
+        increment = self.amplitudes * spike_signal
+        refractory_decay = self.refractory_decay[0] if self.is_scalar else self.refractory_decay
+        decay_factor = refractory_decay * spike_signal
+        
+        return (current_state + increment + 
+                (decay_factor - 1.0) * current_state * spike_signal)
+
+
+class AlphaSynapseProcessor:
+    """Alpha-function synapse processor for multiple receptor types"""
+    
+    def __init__(self, tau_syn: list, dt: float, membrane_params: dict = None):
+        self.num_syn = len(tau_syn)
+        self.dt = dt
+        self.tau_syn = tau_syn
+        
+        # Convert to numpy array
+        self.tau_syn_array = np.array(tau_syn, dtype=np.float32)
+        
+        # Compute synaptic dynamics parameters
+        self._compute_synapse_params(membrane_params)
+        
+        # Initialize synaptic states
+        self.reset_states()
+    
+    def _compute_synapse_params(self, membrane_params):
+        
+        # Compute alpha function coefficients
+        alpha_coeffs = [
+            MathUtils.alpha_coefficients(tau, self.dt) 
+            for tau in self.tau_syn
+        ]
+        
+        # Extract alpha function coefficients
+        alpha_decay_list, alpha_coupling_list = zip(*alpha_coeffs)
+        self.alpha_decay_factors = torch.from_numpy(np.array(alpha_decay_list, dtype=np.float32))
+        self.alpha_coupling_factors = torch.from_numpy(np.array(alpha_coupling_list, dtype=np.float32))
+        
+        # Compute input scaling factors
+        input_scaling_list = [
+            np.e / tau
+            for tau in self.tau_syn
+        ]
+        self.input_scaling_factors = torch.from_numpy(np.array(input_scaling_list, dtype=np.float32))
+        
+        # Compute membrane coupling coefficients
+        if membrane_params is not None:
+            self._compute_membrane_coupling(membrane_params['tau_m'], membrane_params['C_m'])
+        else:
+            # Set to zero when no membrane parameters
+            self.y1_membrane_coeffs = torch.zeros(self.num_syn)
+            self.y2_membrane_coeffs = torch.zeros(self.num_syn)
+    
+    def _compute_membrane_coupling(self, tau_m, C_m):
+        coupling_coeffs = [
+            MathUtils.exponential_coupling(
+                tau_s, tau_m, self.dt, scaling=1.0/C_m
+            )
+            for tau_s in self.tau_syn
+        ]
+        
+        # Extract membrane coupling coefficients
+        y1_coupling_list, y2_coupling_list = zip(*coupling_coeffs)
+        self.y1_membrane_coeffs = torch.from_numpy(np.array(y1_coupling_list, dtype=np.float32))
+        self.y2_membrane_coeffs = torch.from_numpy(np.array(y2_coupling_list, dtype=np.float32))
+    
+    def reset_states(self):
+        self.y1 = torch.zeros(self.num_syn, dtype=torch.float32)
+        self.y2 = torch.zeros(self.num_syn, dtype=torch.float32)
+    
+    def get_current_contribution(self) -> torch.Tensor:
+        """Total synaptic current contribution"""
+        return torch.sum(self.y2)
+    
+    def get_membrane_contribution(self) -> torch.Tensor:
+        """Direct synaptic contribution to membrane potential"""
+        return torch.sum(self.y1_membrane_coeffs * self.y1 + self.y2_membrane_coeffs * self.y2)
+    
+    def integrate_step(self, syn_inputs: Optional[torch.Tensor] = None):
+        """One step synaptic integration"""
+        # Update synaptic state variables
+        new_y2 = self.alpha_coupling_factors * self.y1 + self.alpha_decay_factors * self.y2
+        new_y1 = self.alpha_decay_factors * self.y1
+        
+        # Apply new synaptic inputs
+        if syn_inputs is not None:
+            # Ensure input dimensionality matches number of synaptic receptors
+            syn_inputs_padded = torch.zeros(self.num_syn, dtype=torch.float32)
+            input_length = min(len(syn_inputs), self.num_syn)
+            syn_inputs_padded[:input_length] = syn_inputs[:input_length]
+            
+            # Add weighted synaptic inputs to appropriate state variables
+            new_y1 += self.input_scaling_factors * syn_inputs_padded
+        
+        self.y1 = new_y1
+        self.y2 = new_y2
+    
+    def get_state(self):
+        """Current synaptic state"""
+        return {
+            'y1': self.y1.detach().cpu().numpy(),
+            'y2': self.y2.detach().cpu().numpy(),
+            'current_total': self.get_current_contribution().item()
+        }
 
 
 class GLIF3Neuron(neuron.BaseNode):
@@ -114,6 +331,10 @@ class GLIF3Neuron(neuron.BaseNode):
         **kwargs
             Additional arguments passed to parent neuron.BaseNode class.
         """
+        # Initialize surrogate function
+        if surrogate_function is None:
+            surrogate_function = surrogate.Sigmoid()
+
         # Calculate normalized parameters
         v_threshold_sj = 1.0  # Normalized threshold (always 1.0)
         
@@ -140,12 +361,9 @@ class GLIF3Neuron(neuron.BaseNode):
         # Validate input parameters for biological plausibility and numerical stability
         self._validate_params(V_m, V_th, g, E_L, C_m, t_ref, dt, asc_decay, asc_amps, tau_syn)
         
-        # Store fundamental biophysical parameters as instance attributes
         self.V_m, self.V_th, self.g = V_m, V_th, g
         self.E_L, self.C_m, self.t_ref = E_L, C_m, t_ref
         self.V_reset, self.dt = V_reset, dt
-        
-        # Store differentiability options
         self.refractory_smoothness = refractory_smoothness
         
         # Compute derived membrane properties
@@ -153,25 +371,14 @@ class GLIF3Neuron(neuron.BaseNode):
         self.num_asc = len(asc_decay)  # Number of after-spike current components
         self.num_syn = len(tau_syn)    # Number of synaptic receptor types
         
-        # Pre-compute all integration parameters using NEST-compatible methods
+        # Pre-compute all integration parameters
         self._compute_params(asc_decay, asc_amps, tau_syn, asc_init)
         
         # Initialize all state variables to their resting values
         self._init_states()
     
     def _validate_params(self, V_m, V_th, g, E_L, C_m, t_ref, dt, asc_decay, asc_amps, tau_syn):
-        """
-        Validate all input parameters for biological plausibility and numerical stability.
-        
-        Parameters:
-        -----------
-        All parameters as defined in __init__ method.
-        
-        Raises:
-        -------
-        AssertionError
-            If any parameter violates biological or numerical constraints.
-        """
+        """Validate all input parameters for biological plausibility and numerical stability."""
         assert V_th > V_m, f"Threshold potential ({V_th}mV) must exceed resting potential ({V_m}mV)"
         assert g > 0, f"Membrane conductance ({g}nS) must be positive"
         assert C_m > 0, f"Membrane capacitance ({C_m}pF) must be positive"  
@@ -196,109 +403,37 @@ class GLIF3Neuron(neuron.BaseNode):
         asc_init : list
             Initial ASC values (pA)
         """
-        h = self.dt  # Integration time step
+        self.asc_init = asc_init
         
-        # === After-Spike Current (ASC) Parameters ===
-        # Convert to numpy arrays for vectorized computation
-        asc_decay_array = np.array(asc_decay, dtype=np.float32)
-        asc_amps_array = np.array(asc_amps, dtype=np.float32)
+        # Initialize membrane voltage integrator
+        membrane_rate = 1.0 / self.tau_m
+        self.membrane_integrator = ExponentialIntegrator(
+            rates=membrane_rate, dt=self.dt, scaling=1.0/self.C_m
+        )
         
-        # Compute exact exponential decay factors for discrete time steps
-        asc_decay_dt = np.exp(-asc_decay_array * h)
+        # Initialize ASC integrator
+        self.asc_integrator = ExponentialIntegrator(
+            rates=asc_decay, dt=self.dt, scaling=1/self.dt,
+            amplitudes=asc_amps, t_ref=self.t_ref
+        )
         
-        # Compute stable integration coefficients for ASC contribution to membrane voltage
-        # These coefficients account for the exact integral of ASC over each time step
-        asc_stable_coeff = ((1.0 / asc_decay_array) / h) * (1.0 - asc_decay_dt)
+        # Initialize synapse processor, pass membrane parameters for coupling calculation
+        membrane_params = {
+            'tau_m': self.tau_m,
+            'C_m': self.C_m
+        }
+        self.synapse_processor = AlphaSynapseProcessor(
+            tau_syn=tau_syn, dt=self.dt, 
+            membrane_params=membrane_params
+        )
         
-        # Compute refractory decay rates for ASC
-        # These determine how much ASC remains after the refractory period
-        asc_refractory_decay_rates = np.exp(-asc_decay_array * self.t_ref)
-        
-        # Store as instance attributes
-        self.asc_decay_dt = torch.from_numpy(asc_decay_dt)
-        self.asc_stable_coeff = torch.from_numpy(asc_stable_coeff)
-        self.asc_amps = torch.from_numpy(asc_amps_array)
-        self.asc_refractory_decay_rates = torch.from_numpy(asc_refractory_decay_rates)
-        
-        # === Membrane Voltage Integration Parameters ===
-        # Exact solution for passive membrane equation: V' = -(V-E_L)/tau_m + I/C_m
-        P33 = np.exp(-h / self.tau_m)  # Voltage decay factor
-        P30 = (1.0 / self.C_m) * (1.0 - P33) * self.tau_m  # Current integration factor
-        
-        self.P33 = torch.tensor(P33, dtype=torch.float32)
-        self.P30 = torch.tensor(P30, dtype=torch.float32)
-        
-        # === Synaptic Current Parameters ===
-        # Alpha-function synaptic currents: I_syn(t) = (t/tau) * exp(-t/tau)
-        tau_syn_array = np.array(tau_syn, dtype=np.float32)
-        
-        # Discrete-time evolution parameters for alpha-function state variables
-        P11 = np.exp(-h / tau_syn_array)  # Decay factor (P22 is identical)
-        P21 = h * P11  # Coupling between y1 and y2 state variables
-        
-        # Initial amplitude scaling for unit synaptic input
-        PSC_initial = np.e / tau_syn_array  # Ensures peak current of 1 pA for weight 1
-        
-        self.P11 = torch.from_numpy(P11)
-        self.P21 = torch.from_numpy(P21)
-        self.PSC_initial = torch.from_numpy(PSC_initial)
-        
-        # === Synaptic-Membrane Coupling Parameters ===
-        # Compute exact integration of synaptic currents' effect on membrane voltage
-        P31, P32 = self._compute_syn_coupling(tau_syn_array, h)
-        self.P31 = torch.from_numpy(P31)
-        self.P32 = torch.from_numpy(P32)
-        
-        # === Additional Integration Parameters ===
-        self.v_range = torch.tensor(self.V_th - self.E_L, dtype=torch.float32)
-        self.dt_tensor = torch.tensor(h, dtype=torch.float32)
-        self.t_ref_tensor = torch.tensor(self.t_ref, dtype=torch.float32)
-        self.asc_init_values = torch.tensor(asc_init, dtype=torch.float32)
-    
-    def _compute_syn_coupling(self, tau_syn, h):
-        """
-        Calculate exact integration coefficients for synaptic current effects on membrane voltage.
-        
-        Parameters:
-        -----------
-        tau_syn : np.array
-            Synaptic time constants in milliseconds
-        h : float
-            Integration time step in milliseconds
-            
-        Returns:
-        --------
-        tuple
-            (P31, P32) arrays containing coupling coefficients for each synapse type
-        """
-        P31 = np.zeros(len(tau_syn), dtype=np.float32)
-        P32 = np.zeros(len(tau_syn), dtype=np.float32)
-        
-        for i, tau_s in enumerate(tau_syn):
-            # IAFPropagatorAlpha logic
-            beta = tau_s * self.tau_m / (self.tau_m - tau_s)
-            gamma = beta / self.C_m
-            
-            # Regular case: tau_membrane ≠ tau_synaptic
-            exp_h_tau_syn = np.exp(-h / tau_s)
-            expm1_h_tau = np.expm1(h * (1/tau_s - 1/self.tau_m))
-            
-            P32[i] = gamma * exp_h_tau_syn * expm1_h_tau
-            P31[i] = gamma * exp_h_tau_syn * (beta * expm1_h_tau - h)
-        
-        return P31, P32
-    
     def _init_states(self):
-        """
-        Initialize all dynamic state variables to their appropriate starting values.
-        """
+        """Initialize all dynamic state variables to their appropriate starting values."""
         # Initialize membrane potential relative to leak reversal potential
-        # Store U_ as relative to E_L_, so V_m - E_L
         initial_voltage = self.V_m - self.E_L
         self.U = torch.tensor(initial_voltage, dtype=torch.float32)
         
         # Initialize normalized voltage
-        # Convert initial absolute voltage to normalized voltage (0 to 1, where 1 is threshold)
         voltage_range = self.V_th - self.E_L
         initial_v_normalized = initial_voltage / voltage_range
         
@@ -306,79 +441,66 @@ class GLIF3Neuron(neuron.BaseNode):
         self.v = torch.tensor(initial_v_normalized, dtype=torch.float32)
         
         # Initialize after-spike current state vector
-        self.asc = self.asc_init_values.clone()
+        self.asc = torch.tensor(self.asc_init, dtype=torch.float32)
         
         # Initialize refractory period counter
         self.ref_count = torch.tensor(0.0, dtype=torch.float32)
         
-        # Initialize synaptic state variables for alpha-function dynamics
-        # y1 and y2 represent the two state variables of the alpha function
-        self.y1 = torch.zeros(self.num_syn, dtype=torch.float32)
-        self.y2 = torch.zeros(self.num_syn, dtype=torch.float32)
+        # Reset synapse processor state
+        self.synapse_processor.reset_states()
     
     def neuronal_charge(self, x: torch.Tensor, syn_inputs: Optional[torch.Tensor] = None):
         """
         Update all neuronal state variables for one integration time step.
         
+        Now using modular integration components for better code reusability and maintainability.
+        
         Parameters:
         -----------
         x : torch.Tensor
-            External current injection in picoamperes. Can be scalar or tensor.
+            External current injection (pA), can be scalar or tensor
         syn_inputs : torch.Tensor, optional
-            Synaptic input currents for each receptor type in picoamperes.
-            Shape should be (num_syn,) or broadcastable to this shape.
-            If None, no synaptic input is applied.
+            Synaptic input currents for each receptor type
+             shape should be (num_syn,) or broadcastable
+             if None, no synaptic inputs are applied
         """
-        # === Refractory Period Handling ===
+        # Handle refractory period
         not_refractory = torch.relu(1.0 - self.refractory_smoothness * self.ref_count)
         not_refractory = torch.clamp(not_refractory, 0.0, 1.0)
         
-        # === Membrane Voltage Update (vectorized) ===
-        asc_sum = torch.sum(self.asc_stable_coeff * self.asc)
+        # Calculate ASC contribution to membrane potential
+        asc_contribution = self.asc_integrator.get_membrane_contribution(self.asc)
         
-        # Update membrane voltage using exact solution of passive membrane equation
-        total_current = x + asc_sum
-        voltage_update = self.U * self.P33 + total_current * self.P30
+        # Update synaptic state and get membrane contribution
+        self.synapse_processor.integrate_step(syn_inputs)
+        synaptic_contribution = self.synapse_processor.get_membrane_contribution()
         
-        # Add synaptic contributions using pre-computed coupling coefficients
-        synaptic_contribution = torch.sum(self.P31 * self.y1 + self.P32 * self.y2)
-        voltage_update += synaptic_contribution
+        # Calculate total input current
+        total_current = x + asc_contribution
         
-        # Apply voltage update with refractory modulation
-        self.U = not_refractory * voltage_update + (1.0 - not_refractory) * self.U
+        # Update voltage using membrane voltage integrator
+        self.U = self.membrane_integrator.integrate_step(
+            current_state=self.U,
+            input_current=total_current,
+            modulation_factor=not_refractory
+        )
         
-        # ASC update: update ASC values after calculating contribution
-        asc_update = self.asc * self.asc_decay_dt
-        self.asc = not_refractory * asc_update + (1.0 - not_refractory) * self.asc
+        # Add synaptic contribution
+        self.U += synaptic_contribution
         
-        # === Synaptic State Update (alpha-function evolution) ===
-        # Update both state variables of alpha function for all synapses simultaneously
-        new_y2 = self.P21 * self.y1 + self.P11 * self.y2
-        new_y1 = self.P11 * self.y1
+        # Update ASC state using ASC integrator
+        self.asc = self.asc_integrator.integrate_step(
+            current_state=self.asc,
+            modulation_factor=not_refractory
+        )
         
-        # Apply new synaptic inputs (vectorized)
-        if syn_inputs is not None:
-            # Ensure input dimensionality matches number of synaptic receptors
-            syn_inputs_padded = torch.zeros(self.num_syn, dtype=torch.float32)
-            input_length = min(len(syn_inputs), self.num_syn)
-            syn_inputs_padded[:input_length] = syn_inputs[:input_length]
-            
-            # Add weighted synaptic inputs to appropriate state variables
-            new_y1 += self.PSC_initial * syn_inputs_padded
-        
-        # Update synaptic state variables
-        self.y1 = new_y1
-        self.y2 = new_y2
-        
-        # === Update normalized voltage ===
-        # Convert absolute voltage to normalized voltage (0 to 1, where 1 is threshold)
+        # Update normalized voltage
         voltage_range = self.V_th - self.E_L
         self.v = self.U / voltage_range
         
-        # === Refractory Period Update ===
-        # Decrement refractory counter, ensuring it doesn't go below zero
-        self.ref_count = torch.clamp(self.ref_count - self.dt_tensor, min=0.0)
-
+        # Update refractory period counter
+        self.ref_count = torch.clamp(self.ref_count - self.dt, min=0.0)
+    
     def neuronal_reset(self, spike: torch.Tensor):
         """
         Reset neuronal state variables following spike generation.
@@ -395,7 +517,7 @@ class GLIF3Neuron(neuron.BaseNode):
         else:
             spike_d = spike
         
-        # === Voltage Reset ===
+        # Reset voltage
         if self.v_reset is None:
             # Soft reset: subtract threshold
             self.v = self.jit_soft_reset(self.v, spike_d, self.v_threshold)
@@ -403,22 +525,17 @@ class GLIF3Neuron(neuron.BaseNode):
             # Hard reset: set to reset value
             self.v = self.jit_hard_reset(self.v, spike_d, self.v_reset)
         
-        # === Update absolute voltage ===
-        # Convert normalized v back to absolute voltage
+        # Update absolute voltage
         voltage_range = self.V_th - self.E_L
         self.U = self.v * voltage_range
         
-        # === After-Spike Current Update ===
+        # Use ASC integrator to handle adaptation current updates after spike
         spike_continuous = spike  # Use continuous values directly
-        asc_increment = self.asc_amps * spike_continuous
-        asc_decay_factor = self.asc_refractory_decay_rates * spike_continuous
+        self.asc = self.asc_integrator.apply_spike_increment(self.asc, spike_continuous)
         
-        # Update ASC with smooth transition
-        self.asc = self.asc + asc_increment + (asc_decay_factor - 1.0) * self.asc * spike_continuous
-        
-        # === Refractory Period Initiation ===
+        # Initiate refractory period
         spike_continuous = spike
-        refractory_increment = self.t_ref_tensor * spike_continuous
+        refractory_increment = self.t_ref * spike_continuous
         self.ref_count = self.ref_count + refractory_increment
     
     def forward(self, x: torch.Tensor, syn_inputs: Optional[torch.Tensor] = None):
@@ -467,59 +584,36 @@ class GLIF3Neuron(neuron.BaseNode):
             - 'syn_total': Sum of all synaptic current contributions
             - 'ref_count': Remaining refractory period duration
             - 'detailed': Nested dictionary with individual component values
+            - 'modular_states': States from individual modular components
         """
         return {
             'v_mV': (self.U + self.E_L).item(),
             'U_rel_mV': self.U.item(),
             'asc_total': self.asc.sum().item(),
-            'syn_total': self.y2.sum().item(),
+            'syn_total': self.synapse_processor.get_current_contribution().item(),
             'ref_count': self.ref_count.item(),
             'detailed': {
                 'asc_components': self.asc.detach().cpu().numpy(),
-                'synaptic_y1': self.y1.detach().cpu().numpy(),
-                'synaptic_y2': self.y2.detach().cpu().numpy(),
+                'synaptic_y1': self.synapse_processor.y1.detach().cpu().numpy(),
+                'synaptic_y2': self.synapse_processor.y2.detach().cpu().numpy(),
+            },
+            'modular_states': {
+                'synapse_processor': self.synapse_processor.get_state(),
+                'asc_membrane_contribution': self.asc_integrator.get_membrane_contribution(self.asc).item(),
+                'synaptic_membrane_contribution': self.synapse_processor.get_membrane_contribution().item()
             }
         }
+
 
 # ============================================================================
 # Utility Functions and Analysis Tools
 # ============================================================================
 
-def load_params(json_file):
-    """
-    Load neuron parameters from Allen Institute JSON parameter file.
-    
-    Parameters:
-    -----------
-    json_file : str
-        Path to JSON file containing neuron parameters in Allen Institute format.
-        
-    Returns:
-    --------
-    dict
-        Dictionary containing all neuron parameters with standard names.
-    """
-    with open(json_file, 'r') as f:
-        return json.load(f)
-
 
 def create_glif3_from_params(params_file, dt=0.1):
-    """
-    Factory function to create GLIF3 neuron from Allen Institute parameter file.
-    
-    Parameters:
-    -----------
-    params_file : str
-        Path to JSON parameter file from Allen Institute Cell Types Database.
-    dt : float, optional
-        Integration time step in milliseconds. Default is 0.1 ms for numerical stability.
-        
-    Returns:
-    --------
-    GLIF3Neuron
-        Fully configured neuron instance ready for simulation.
-    """
-    params = load_params(params_file)
+    """Load neuron parameters from Allen Institute JSON parameter file."""
+    with open(params_file, 'r') as f:
+        params = json.load(f)
     return GLIF3Neuron(
         V_m=params['V_m'],
         V_th=params['V_th'], 
@@ -634,9 +728,7 @@ def test_fi_curve(neuron, current_range, duration=1000, dt=0.1, stim_start=200, 
 
 
 def main():
-    """
-    Demonstrate the GLIF3 neuron implementation.
-    """
+    """Demonstrate the GLIF3 neuron implementation."""
     # Define path to Allen Institute parameter file
     params_file = ('/home/user/Documents/Training-data-driven-V1-model-test/'
                    'Allen_V1_param/components/cell_models/nest_models/475622680_glif_psc.json')
